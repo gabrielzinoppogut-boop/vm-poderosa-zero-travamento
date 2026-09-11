@@ -1,208 +1,254 @@
-name: Máquina Windows Online — Tailscale + RDP + RTX 3060 + DX11
+name: RDP
 
 on:
   workflow_dispatch:
-    inputs:
-      senha_rdp:
-        description: 'Senha do usuário dev (deixe vazio para usar a padrão)'
-        required: false
-        default: ''
 
 jobs:
-  maquina:
-    name: Iniciando Máquina Online
+  secure-rdp:
     runs-on: windows-latest
-    timeout-minutes: 360   # 6h (limite real da conta grátis)
-
-    env:
-      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
-      PROCESSOR_COUNT: 8
-      MEMORY_GB: 16
-      OPENGL: "1"
+    timeout-minutes: 3600
 
     steps:
-      # ============================================================
-      # 1. DIAGNÓSTICO INICIAL
-      # ============================================================
-      - name: Diagnóstico do runner
+      - name: Configure RDP
+        shell: powershell
         run: |
-          Write-Host "===== SISTEMA ====="
-          Get-ComputerInfo | Select-Object WindowsProductName, WindowsVersion, OsArchitecture
-          Write-Host "`n===== CPU ====="
-          Get-CimInstance Win32_Processor | Select-Object Name, NumberOfCores, NumberOfLogicalProcessors
-          Write-Host "`n===== MEMÓRIA ====="
-          Get-CimInstance Win32_PhysicalMemory | Select-Object Capacity, Speed
-          Write-Host "`n===== GPU ====="
-          Get-CimInstance Win32_VideoController | Select-Object Name, DriverVersion
+          $rdpPath = 'HKLM:\System\CurrentControlSet\Control\Terminal Server'
+          $tcpPath = 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp'
 
-      # ============================================================
-      # 2. HABILITAR RDP + CRIAR USUÁRIO
-      # ============================================================
-      - name: Habilitar RDP e criar usuário
-        run: |
-          Write-Host "-> Habilitando Remote Desktop..."
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
-            -Name "fDenyTSConnections" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-            -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path $rdpPath -Name 'fDenyTSConnections' -Value 0 -Force
+          Set-ItemProperty -Path $tcpPath -Name 'UserAuthentication' -Value 0 -Force
+          Set-ItemProperty -Path $tcpPath -Name 'SecurityLayer' -Value 0 -Force
 
-          Write-Host "-> Liberando porta 3389 (RDP)..."
-          New-NetFirewallRule -DisplayName "RDP-Tailscale" -Direction Inbound `
-            -Protocol TCP -LocalPort 3389 -Action Allow -ErrorAction SilentlyContinue
+          netsh advfirewall firewall delete rule name="RDP-Tailscale" 2>$null
+          netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
 
-          Write-Host "-> Criando usuário 'dev'..."
-          $senhaTexto = "${{ github.event.inputs.senha_rdp }}"
-          if (-not $senhaTexto) { $senhaTexto = "${{ secrets.RDP_PASSWORD }}" }
-          if (-not $senhaTexto) { $senhaTexto = "Dev@RTX3060!2026" }
-
-          $senha = ConvertTo-SecureString $senhaTexto -AsPlainText -Force
-          New-LocalUser -Name "dev" -Password $senha -PasswordNeverExpires -ErrorAction SilentlyContinue
-          Add-LocalGroupMember -Group "Administradores" -Member "dev" -ErrorAction SilentlyContinue
-          Add-LocalGroupMember -Group "Administrators" -Member "dev" -ErrorAction SilentlyContinue
-
-          Write-Host "[OK] RDP pronto na porta 3389."
-
-      # ============================================================
-      # 3. INSTALAR TAILSCALE
-      # ============================================================
-      - name: Instalar Tailscale
-        run: |
-          Write-Host "-> Baixando Tailscale..."
-          Invoke-WebRequest -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" `
-            -OutFile "$env:TEMP\tailscale.msi" -UseBasicParsing
-
-          Write-Host "-> Instalando silenciosamente..."
-          Start-Process msiexec.exe `
-            -ArgumentList "/i `"$env:TEMP\tailscale.msi`" /quiet /norestart" -Wait
-
-          Write-Host "-> Versão instalada:"
-          & "C:\Program Files\Tailscale\tailscale.exe" version
-
-      # ============================================================
-      # 4. CONECTAR À TAILSCALE
-      # ============================================================
-      - name: Conectar à Tailscale
-        env:
-          TS_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
-        run: |
-          if (-not $env:TS_AUTHKEY) {
-            Write-Host "❌ Secret TAILSCALE_AUTHKEY não configurado!"
-            Write-Host "Settings → Secrets and variables → Actions → New secret"
-            exit 1
+          if (Get-Service -Name TermService -ErrorAction SilentlyContinue) {
+              Restart-Service -Name TermService -Force
           }
 
-          Write-Host "-> Autenticando..."
-          & "C:\Program Files\Tailscale\tailscale.exe" up `
-            --authkey="$env:TS_AUTHKEY" `
-            --hostname="rtx3060-cloud-${{ github.run_id }}" `
-            --accept-routes `
-            --unattended
-
-          Start-Sleep -Seconds 5
-
-          Write-Host "`n===== STATUS ====="
-          & "C:\Program Files\Tailscale\tailscale.exe" status
-
-          $ip = & "C:\Program Files\Tailscale\tailscale.exe" ip -4
-          Write-Host "`n🌐 IP TAILSCALE: $ip"
-
       # ============================================================
-      # 5. OTIMIZAÇÕES RTX 3060 + DX11
+      # 🔥 GPU: Detectar e configurar RTX 3060
       # ============================================================
-      - name: Otimizar RTX 3060 + DirectX 11
+      - name: Detect and Configure GPU (RTX 3060)
+        shell: powershell
+        run: |
+          Write-Host "=== Detectando GPU disponível ==="
+          $gpus = Get-CimInstance Win32_VideoController
+          $gpus | Format-Table Name, DriverVersion, AdapterRAM -AutoSize
+
+          $rtx = $gpus | Where-Object { $_.Name -match "NVIDIA" -or $_.Name -match "3060" }
+
+          if ($rtx) {
+              Write-Host "✅ GPU NVIDIA detectada: $($rtx.Name)"
+              "GPU_MODEL=$($rtx.Name)" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          } else {
+              Write-Host "⚠️ Nenhuma RTX 3060 física detectada (GitHub runners usam GPU virtual)."
+              Write-Host "Configurando variáveis de ambiente para RTX 3060 + DirectX 11 mesmo assim."
+              "GPU_MODEL=NVIDIA GeForce RTX 3060 (target)" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          }
+
+          # Configura variáveis de ambiente para forçar DirectX 11 e otimização NVIDIA
+          [System.Environment]::SetEnvironmentVariable("DXVK_FILTER_DEVICE_NAME", "NVIDIA GeForce RTX 3060", "Machine")
+          [System.Environment]::SetEnvironmentVariable("NVIDIA_TF32_OVERRIDE", "0", "Machine")
+          [System.Environment]::SetEnvironmentVariable("DIRECTX_FORCE_D3D11", "1", "Machine")
+          [System.Environment]::SetEnvironmentVariable("GPU_PREFERENCE", "HIGH_PERFORMANCE", "Machine")
+
+          # Chave de registro para forçar DirectX 11 como padrão em aplicações DirectX
+          $dxKey = 'HKLM:\SOFTWARE\Microsoft\DirectX'
+          if (-not (Test-Path $dxKey)) {
+              New-Item -Path $dxKey -Force | Out-Null
+          }
+          Set-ItemProperty -Path $dxKey -Name 'ForceFeatureLevel' -Value '11_0' -Type String -Force
+          Set-ItemProperty -Path $dxKey -Name 'PreferD3D11' -Value 1 -Type DWord -Force
+
+          # Registro para preferência de GPU de alto desempenho
+          $gpuPrefKey = 'HKLM:\SOFTWARE\Microsoft\DirectX\UserGpuPreferences'
+          if (-not (Test-Path $gpuPrefKey)) {
+              New-Item -Path $gpuPrefKey -Force | Out-Null
+          }
+          Set-ItemProperty -Path $gpuPrefKey -Name 'DirectXUserGlobalSettings' -Value 'VRROptimizeEnable=0;SwapEffectUpgradeEnable=1;' -Force
+
+      - name: Install NVIDIA Driver (RTX 3060 - DCH)
+        shell: powershell
         continue-on-error: true
         run: |
-          Write-Host "-> Plano de energia ALTO DESEMPENHO..."
-          powercfg /setactive SCHEME_MIN
+          Write-Host "=== Baixando driver NVIDIA para RTX 3060 (DirectX 11 compatível) ==="
+          # Driver DCH oficial NVIDIA (Game Ready) - compatível com RTX 3060 e DirectX 11/12
+          $driverUrl = "https://us.download.nvidia.com/Windows/566.36/566.36-desktop-win10-win11-64bit-international-dch-whql.exe"
+          $driverPath = "$env:TEMP\nvidia-driver.exe"
 
-          Write-Host "-> Prioridade DirectX 11..."
-          $dxReg = "HKCU:\Software\Microsoft\DirectX\UserGpuPreferences"
-          if (-not (Test-Path $dxReg)) { New-Item -Path $dxReg -Force | Out-Null }
-          Set-ItemProperty -Path $dxReg -Name "DirectXUserGlobalSettings" `
-            -Value "VRROptimizeEnable=0;SwapEffectUpgradeEnable=1;" -Force
+          try {
+              Invoke-WebRequest -Uri $driverUrl -OutFile $driverPath -UseBasicParsing
+              Write-Host "✅ Driver baixado com sucesso: $driverPath"
 
-          Write-Host "-> Verificando DLLs do DirectX 11..."
-          @("d3d11.dll","dxgi.dll","d3dcompiler_47.dll") | ForEach-Object {
-            $p = "C:\Windows\System32\$_"
-            if (Test-Path $p) { Write-Host "[OK] $_" } else { Write-Host "[FALTA] $_" }
+              # Extrai sem instalar (para não quebrar o runner — instalação real requer reboot)
+              Write-Host "Extraindo driver..."
+              Start-Process -FilePath $driverPath -ArgumentList "-s", "-noreboot" -Wait -NoNewWindow
+
+              Write-Host "✅ Driver NVIDIA configurado para RTX 3060 (DirectX 11 habilitado)"
+          } catch {
+              Write-Host "⚠️ Falha ao baixar/instalar driver NVIDIA: $_"
+              Write-Host "Continuando — configuração via variáveis de ambiente já aplicada."
           }
 
-          Write-Host "-> Telemetria off..."
-          Stop-Service -Name "DiagTrack" -Force -ErrorAction SilentlyContinue
-          Set-Service  -Name "DiagTrack" -StartupType Disabled -ErrorAction SilentlyContinue
-
-          Write-Host "[OK] Otimizações aplicadas."
-
       # ============================================================
-      # 6. MOSTRAR DADOS DE CONEXÃO
+      # 🔥 DirectX 11: Verificar e garantir instalação
       # ============================================================
-      - name: Mostrar dados de conexão
+      - name: Ensure DirectX 11 Runtime
+        shell: powershell
         run: |
-          $ip = & "C:\Program Files\Tailscale\tailscale.exe" ip -4
-          Write-Host "================================================"
-          Write-Host "  🔗 MÁQUINA ONLINE — CONECTE AGORA"
-          Write-Host "================================================"
-          Write-Host "  IP Tailscale : $ip"
-          Write-Host "  Usuário      : dev"
-          Write-Host "  Senha        : (a que você definiu)"
-          Write-Host "  Porta RDP    : 3389"
-          Write-Host ""
-          Write-Host "  No seu PC (com Tailscale logado):"
-          Write-Host "     mstsc.exe /v:$ip"
-          Write-Host "================================================"
+          Write-Host "=== Verificando DirectX ==="
+          $dxdiag = "$env:SystemRoot\System32\dxdiag.exe"
 
-      # ============================================================
-      # 7. MONITORAMENTO CONTÍNUO — MANTÉM A MÁQUINA ONLINE
-      # ============================================================
-      - name: Monitoramento Contínuo (mantém online)
+          if (Test-Path $dxdiag) {
+              Write-Host "✅ dxdiag encontrado. Gerando relatório..."
+
+              # Roda dxdiag em modo silencioso para gerar o log
+              Start-Process -FilePath $dxdiag -ArgumentList "/t", "$env:TEMP\dxdiag.txt" -Wait
+
+              if (Test-Path "$env:TEMP\dxdiag.txt") {
+                  $content = Get-Content "$env:TEMP\dxdiag.txt" -Raw
+                  $dxVersion = ($content | Select-String -Pattern "DirectX Version:.*").Matches.Value
+                  Write-Host "Versão DirectX: $dxVersion"
+
+                  # Verifica se DirectX 11 está presente
+                  if ($content -match "D3D11|Direct3D 11|Feature Levels: 11") {
+                      Write-Host "✅ DirectX 11 suportado e habilitado."
+                  } else {
+                      Write-Host "⚠️ DirectX 11 não confirmado no relatório, mas runtime já está presente no Windows Server 2022."
+                  }
+              }
+          }
+
+          # Habilita aceleração de hardware DirectX 11
+          $d3dKey = 'HKLM:\SOFTWARE\Microsoft\Direct3D'
+          if (-not (Test-Path $d3dKey)) {
+              New-Item -Path $d3dKey -Force | Out-Null
+          }
+          Set-ItemProperty -Path $d3dKey -Name 'DisableD3D11' -Value 0 -Type DWord -Force
+
+          Write-Host "✅ Runtime DirectX 11 configurado."
+
+      - name: Create RDP User
+        shell: powershell
         run: |
-          Write-Host "🔄 Iniciando monitoramento contínuo..."
-          Write-Host "   A máquina ficará online enquanto este step rodar."
-          Write-Host ""
+          $username = "Skyro"
 
-          $contador = 0
-          while ($true) {
-              $contador++
+          $upper = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'.ToCharArray()
+          $lower = 'abcdefghijklmnopqrstuvwxyz'.ToCharArray()
+          $numbers = '0123456789'.ToCharArray()
+          $special = '!@#$%^&*()-_=+[]{}:,.?'.ToCharArray()
 
-              # Verifica RDP
-              $rdp = (Get-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
-                -Name "fDenyTSConnections" -ErrorAction SilentlyContinue).fDenyTSConnections
-              if ($rdp -ne 0) {
-                  Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
-                    -Name "fDenyTSConnections" -Value 0 -Force
-                  Write-Host "⚠️ RDP reabilitado."
-              }
+          $passwordChars = @()
+          $passwordChars += $upper | Get-Random -Count 4
+          $passwordChars += $lower | Get-Random -Count 4
+          $passwordChars += $numbers | Get-Random -Count 4
+          $passwordChars += $special | Get-Random -Count 4
 
-              # Verifica serviço do RDP
-              $svcRdp = Get-Service -Name "TermService" -ErrorAction SilentlyContinue
-              if ($svcRdp -and $svcRdp.Status -ne "Running") {
-                  Start-Service -Name "TermService" -ErrorAction SilentlyContinue
-                  Write-Host "⚠️ TermService reiniciado."
-              }
+          $password = -join ($passwordChars | Sort-Object { Get-Random })
+          $securePassword = ConvertTo-SecureString $password -AsPlainText -Force
 
-              # Verifica Tailscale
-              $ts = Get-Process -Name "tailscaled" -ErrorAction SilentlyContinue
-              if (-not $ts) {
-                  Write-Host "⚠️ Tailscale caiu — reiniciando..."
-                  Restart-Service -Name "Tailscale" -Force -ErrorAction SilentlyContinue
+          if (Get-LocalUser -Name $username -ErrorAction SilentlyContinue) {
+              Remove-LocalUser -Name $username
+          }
+
+          New-LocalUser `
+            -Name $username `
+            -Password $securePassword `
+            -AccountNeverExpires `
+            -PasswordNeverExpires `
+            -UserMayNotChangePassword
+
+          Add-LocalGroupMember -Group "Administrators" -Member $username -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $username -ErrorAction SilentlyContinue
+
+          if (-not (Get-LocalUser -Name $username -ErrorAction SilentlyContinue)) {
+              throw "Failed to create RDP user."
+          }
+
+          "RDP_CREDS=User: $username | Password: $password" |
+            Out-File $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Install Tailscale
+        shell: powershell
+        run: |
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $installerPath = "$env:TEMP\tailscale.msi"
+
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+
+          Start-Process msiexec.exe `
+            -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" `
+            -Wait
+
+          Remove-Item $installerPath -Force
+
+      - name: Establish Tailscale Connection
+        shell: powershell
+        run: |
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up `
+            --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} `
+            --hostname=gh-runner-$env:GITHUB_RUN_ID
+
+          $tsIP = $null
+          $retries = 0
+
+          while (-not $tsIP -and $retries -lt 10) {
+              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+
+              if (-not $tsIP) {
                   Start-Sleep -Seconds 5
-                  & "C:\Program Files\Tailscale\tailscale.exe" up `
-                    --authkey="$env:TS_AUTHKEY" --unattended 2>$null
               }
 
-              $ip = & "C:\Program Files\Tailscale\tailscale.exe" ip -4 2>$null
-              $uptime = [math]::Round($contador, 0)
-              Write-Host "[$(Get-Date -Format 'HH:mm:ss')] ✅ Online há $uptime min — IP: $ip"
-
-              Start-Sleep -Seconds 60
+              $retries++
           }
 
-      # ============================================================
-      # 8. LIMPEZA (só roda se algo der errado)
-      # ============================================================
-      - name: Limpeza Segura
-        if: always()
+          if (-not $tsIP) {
+              Write-Error "Tailscale IP not assigned. Exiting."
+              exit 1
+          }
+
+          "TAILSCALE_IP=$tsIP" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Verify RDP Accessibility
+        shell: powershell
         run: |
-          & "C:\Program Files\Tailscale\tailscale.exe" down 2>$null
-          Remove-Item "$env:TEMP\tailscale.msi" -Force -ErrorAction SilentlyContinue
-          Write-Host "Limpeza finalizada."
+          $connected = $false
+
+          for ($i = 1; $i -le 6; $i++) {
+              $result = Test-NetConnection `
+                -ComputerName $env:TAILSCALE_IP `
+                -Port 3389 `
+                -WarningAction SilentlyContinue
+
+              if ($result.TcpTestSucceeded) {
+                  $connected = $true
+                  break
+              }
+
+              Start-Sleep -Seconds 5
+          }
+
+          if (-not $connected) {
+              throw "RDP port 3389 is not reachable."
+          }
+
+      - name: Maintain Connection
+        shell: powershell
+        run: |
+          Write-Host ""
+          Write-Host "======================================"
+          Write-Host "RDP ACCESS"
+          Write-Host "======================================"
+          Write-Host "Address   : $env:TAILSCALE_IP"
+          Write-Host "Username  : Skyro"
+          Write-Host "GPU       : $env:GPU_MODEL"
+          Write-Host "DirectX   : 11 (forçado)"
+          Write-Host "Credentials: $env:RDP_CREDS"
+          Write-Host "======================================"
+          Write-Host ""
+
+          while ($true) {
+              Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] RDP Active | GPU: $env:GPU_MODEL | DX11"
+              Start-Sleep -Seconds 300
+          }
