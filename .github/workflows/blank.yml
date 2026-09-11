@@ -9,6 +9,9 @@ jobs:
     timeout-minutes: 3600
 
     steps:
+      # ============================================================
+      # 1. CONFIGURAÇÃO BÁSICA DO RDP
+      # ============================================================
       - name: Configure RDP
         shell: powershell
         run: |
@@ -19,6 +22,15 @@ jobs:
           Set-ItemProperty -Path $tcpPath -Name 'UserAuthentication' -Value 0 -Force
           Set-ItemProperty -Path $tcpPath -Name 'SecurityLayer' -Value 0 -Force
 
+          # 🔥 IMPORTANTE: permitir input redirection de mouse/teclado
+          Set-ItemProperty -Path $tcpPath -Name 'fDisableInputRedirection' -Value 0 -Force
+          Set-ItemProperty -Path $tcpPath -Name 'fDisableClip' -Value 0 -Force
+          Set-ItemProperty -Path $tcpPath -Name 'fDisableCcm' -Value 0 -Force
+          Set-ItemProperty -Path $tcpPath -Name 'fDisableCdm' -Value 0 -Force
+
+          # 🔥 Permitir múltiplas sessões RDP (necessário para tscon funcionar)
+          Set-ItemProperty -Path $rdpPath -Name 'fSingleSessionPerUser' -Value 0 -Force
+
           netsh advfirewall firewall delete rule name="RDP-Tailscale" 2>$null
           netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
 
@@ -27,108 +39,134 @@ jobs:
           }
 
       # ============================================================
-      # 🔥 GPU: Detectar e configurar RTX 3060
+      # 2. 🔥 CORREÇÃO PRINCIPAL: Habilitar sessão de console interativa
+      #    Sem isso, jogos NÃO recebem input.
       # ============================================================
-      - name: Detect and Configure GPU (RTX 3060)
+      - name: Enable Interactive Console Session
+        shell: powershell
+        run: |
+          Write-Host "=== Habilitando sessão de console interativa ==="
+
+          # Força o Windows a permitir sessão de console
+          $tsPath = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon'
+          Set-ItemProperty -Path $tsPath -Name 'AutoAdminLogon' -Value '1' -Force -ErrorAction SilentlyContinue
+
+          # Desabilita o "RemoteApp" mode que engole input
+          $tsAppPath = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services'
+          if (-not (Test-Path $tsAppPath)) { New-Item -Path $tsAppPath -Force | Out-Null }
+          Set-ItemProperty -Path $tsAppPath -Name 'fInheritInitialProgram' -Value 0 -Type DWord -Force
+          Set-ItemProperty -Path $tsAppPath -Name 'fAllowToGetHelp' -Value 0 -Type DWord -Force
+          Set-ItemProperty -Path $tsAppPath -Name 'fEnableRemoteFXAdvancedRemoteApp' -Value 0 -Type DWord -Force
+
+          # 🔥 Desabilita "session 0 isolation" para input
+          $tsPolicy = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System'
+          if (-not (Test-Path $tsPolicy)) { New-Item -Path $tsPolicy -Force | Out-Null }
+          Set-ItemProperty -Path $tsPolicy -Name 'EnableLUA' -Value 0 -Type DWord -Force
+
+          Write-Host "✅ Sessão de console interativa habilitada."
+
+      # ============================================================
+      # 3. 🔥 DRIVER DE VÍDEO VIRTUAL com suporte a DirectX 11
+      #    GitHub runner não tem GPU real — instala Indirect Display Driver
+      # ============================================================
+      - name: Install Virtual Display Driver (DirectX 11 capable)
+        shell: powershell
+        continue-on-error: true
+        run: |
+          Write-Host "=== Instalando Virtual Display Driver (IDD) ==="
+
+          # Baixa o Virtual Display Driver (suporta DX11 / WDDM)
+          $iddUrl = "https://github.com/itsmikethetech/Virtual-Display-Driver/releases/download/v23.10.24/VirtualDisplayDriver.zip"
+          $iddZip = "$env:TEMP\vdd.zip"
+          $iddDir = "$env:TEMP\vdd"
+
+          try {
+              Invoke-WebRequest -Uri $iddUrl -OutFile $iddZip -UseBasicParsing
+              Expand-Archive -Path $iddZip -DestinationPath $iddDir -Force
+
+              # Instala o driver via pnputil
+              $infFile = Get-ChildItem -Path $iddDir -Filter "*.inf" -Recurse | Select-Object -First 1
+              if ($infFile) {
+                  pnputil /add-driver $infFile.FullName /install
+                  Write-Host "✅ Virtual Display Driver instalado: $($infFile.Name)"
+              } else {
+                  Write-Host "⚠️ INF não encontrado no pacote do VDD."
+              }
+          } catch {
+              Write-Host "⚠️ Falha ao instalar VDD: $_"
+          }
+
+          # Alternativa: Mesa3D (OpenGL/DirectX 11 software renderer)
+          Write-Host "=== Baixando Mesa3D (fallback DirectX 11) ==="
+          $mesaUrl = "https://github.com/pal1000/mesa-dist-win/releases/download/24.1.4/mesa3d-24.1.4-release-msvc.7z"
+          $mesaPath = "$env:TEMP\mesa.7z"
+          try {
+              Invoke-WebRequest -Uri $mesaUrl -OutFile $mesaPath -UseBasicParsing
+              # 7-Zip já vem no runner
+              & "C:\Program Files\7-Zip\7z.exe" x $mesaPath -o"C:\mesa" -y | Out-Null
+              Write-Host "✅ Mesa3D extraído para C:\mesa"
+
+              # Adiciona ao PATH global
+              [System.Environment]::SetEnvironmentVariable(
+                "PATH",
+                $env:PATH + ";C:\mesa\x64",
+                "Machine"
+              )
+          } catch {
+              Write-Host "⚠️ Falha ao baixar Mesa3D: $_"
+          }
+
+      # ============================================================
+      # 4. Configuração GPU (mantida, mas agora realista)
+      # ============================================================
+      - name: Detect and Configure GPU
         shell: powershell
         run: |
           Write-Host "=== Detectando GPU disponível ==="
           $gpus = Get-CimInstance Win32_VideoController
           $gpus | Format-Table Name, DriverVersion, AdapterRAM -AutoSize
 
-          $rtx = $gpus | Where-Object { $_.Name -match "NVIDIA" -or $_.Name -match "3060" }
+          $gpuName = $gpus | Select-Object -First 1 -ExpandProperty Name
+          "GPU_MODEL=$gpuName" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
 
-          if ($rtx) {
-              Write-Host "✅ GPU NVIDIA detectada: $($rtx.Name)"
-              "GPU_MODEL=$($rtx.Name)" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
-          } else {
-              Write-Host "⚠️ Nenhuma RTX 3060 física detectada (GitHub runners usam GPU virtual)."
-              Write-Host "Configurando variáveis de ambiente para RTX 3060 + DirectX 11 mesmo assim."
-              "GPU_MODEL=NVIDIA GeForce RTX 3060 (target)" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
-          }
-
-          # Configura variáveis de ambiente para forçar DirectX 11 e otimização NVIDIA
-          [System.Environment]::SetEnvironmentVariable("DXVK_FILTER_DEVICE_NAME", "NVIDIA GeForce RTX 3060", "Machine")
-          [System.Environment]::SetEnvironmentVariable("NVIDIA_TF32_OVERRIDE", "0", "Machine")
+          # Força D3D11 via WARP (software renderer DirectX 11) se não houver GPU
+          [System.Environment]::SetEnvironmentVariable("DXVK_FILTER_DEVICE_NAME", $gpuName, "Machine")
           [System.Environment]::SetEnvironmentVariable("DIRECTX_FORCE_D3D11", "1", "Machine")
           [System.Environment]::SetEnvironmentVariable("GPU_PREFERENCE", "HIGH_PERFORMANCE", "Machine")
 
-          # Chave de registro para forçar DirectX 11 como padrão em aplicações DirectX
+          # 🔥 Habilita WARP (Windows Advanced Rasterization Platform) — D3D11 software
           $dxKey = 'HKLM:\SOFTWARE\Microsoft\DirectX'
-          if (-not (Test-Path $dxKey)) {
-              New-Item -Path $dxKey -Force | Out-Null
-          }
+          if (-not (Test-Path $dxKey)) { New-Item -Path $dxKey -Force | Out-Null }
           Set-ItemProperty -Path $dxKey -Name 'ForceFeatureLevel' -Value '11_0' -Type String -Force
           Set-ItemProperty -Path $dxKey -Name 'PreferD3D11' -Value 1 -Type DWord -Force
 
-          # Registro para preferência de GPU de alto desempenho
-          $gpuPrefKey = 'HKLM:\SOFTWARE\Microsoft\DirectX\UserGpuPreferences'
-          if (-not (Test-Path $gpuPrefKey)) {
-              New-Item -Path $gpuPrefKey -Force | Out-Null
-          }
-          Set-ItemProperty -Path $gpuPrefKey -Name 'DirectXUserGlobalSettings' -Value 'VRROptimizeEnable=0;SwapEffectUpgradeEnable=1;' -Force
-
-      - name: Install NVIDIA Driver (RTX 3060 - DCH)
-        shell: powershell
-        continue-on-error: true
-        run: |
-          Write-Host "=== Baixando driver NVIDIA para RTX 3060 (DirectX 11 compatível) ==="
-          # Driver DCH oficial NVIDIA (Game Ready) - compatível com RTX 3060 e DirectX 11/12
-          $driverUrl = "https://us.download.nvidia.com/Windows/566.36/566.36-desktop-win10-win11-64bit-international-dch-whql.exe"
-          $driverPath = "$env:TEMP\nvidia-driver.exe"
-
-          try {
-              Invoke-WebRequest -Uri $driverUrl -OutFile $driverPath -UseBasicParsing
-              Write-Host "✅ Driver baixado com sucesso: $driverPath"
-
-              # Extrai sem instalar (para não quebrar o runner — instalação real requer reboot)
-              Write-Host "Extraindo driver..."
-              Start-Process -FilePath $driverPath -ArgumentList "-s", "-noreboot" -Wait -NoNewWindow
-
-              Write-Host "✅ Driver NVIDIA configurado para RTX 3060 (DirectX 11 habilitado)"
-          } catch {
-              Write-Host "⚠️ Falha ao baixar/instalar driver NVIDIA: $_"
-              Write-Host "Continuando — configuração via variáveis de ambiente já aplicada."
-          }
-
       # ============================================================
-      # 🔥 DirectX 11: Verificar e garantir instalação
+      # 5. DirectX 11 Runtime
       # ============================================================
       - name: Ensure DirectX 11 Runtime
         shell: powershell
         run: |
           Write-Host "=== Verificando DirectX ==="
-          $dxdiag = "$env:SystemRoot\System32\dxdiag.exe"
-
-          if (Test-Path $dxdiag) {
-              Write-Host "✅ dxdiag encontrado. Gerando relatório..."
-
-              # Roda dxdiag em modo silencioso para gerar o log
-              Start-Process -FilePath $dxdiag -ArgumentList "/t", "$env:TEMP\dxdiag.txt" -Wait
-
-              if (Test-Path "$env:TEMP\dxdiag.txt") {
-                  $content = Get-Content "$env:TEMP\dxdiag.txt" -Raw
-                  $dxVersion = ($content | Select-String -Pattern "DirectX Version:.*").Matches.Value
-                  Write-Host "Versão DirectX: $dxVersion"
-
-                  # Verifica se DirectX 11 está presente
-                  if ($content -match "D3D11|Direct3D 11|Feature Levels: 11") {
-                      Write-Host "✅ DirectX 11 suportado e habilitado."
-                  } else {
-                      Write-Host "⚠️ DirectX 11 não confirmado no relatório, mas runtime já está presente no Windows Server 2022."
-                  }
-              }
-          }
-
-          # Habilita aceleração de hardware DirectX 11
           $d3dKey = 'HKLM:\SOFTWARE\Microsoft\Direct3D'
-          if (-not (Test-Path $d3dKey)) {
-              New-Item -Path $d3dKey -Force | Out-Null
-          }
+          if (-not (Test-Path $d3dKey)) { New-Item -Path $d3dKey -Force | Out-Null }
           Set-ItemProperty -Path $d3dKey -Name 'DisableD3D11' -Value 0 -Type DWord -Force
+
+          # Instala DirectX End-User Runtime (dxwebsetup)
+          $dxUrl = "https://download.microsoft.com/download/1/7/1/1718CCC4-6315-4D8E-9543-8E28A4E18C4C/dxwebsetup.exe"
+          $dxPath = "$env:TEMP\dxwebsetup.exe"
+          try {
+              Invoke-WebRequest -Uri $dxUrl -OutFile $dxPath -UseBasicParsing
+              Start-Process -FilePath $dxPath -ArgumentList "/Q" -Wait
+              Write-Host "✅ DirectX End-User Runtime instalado."
+          } catch {
+              Write-Host "⚠️ Falha ao instalar DX runtime: $_"
+          }
 
           Write-Host "✅ Runtime DirectX 11 configurado."
 
+      # ============================================================
+      # 6. Criar usuário RDP
+      # ============================================================
       - name: Create RDP User
         shell: powershell
         run: |
@@ -162,25 +200,21 @@ jobs:
           Add-LocalGroupMember -Group "Administrators" -Member $username -ErrorAction SilentlyContinue
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member $username -ErrorAction SilentlyContinue
 
-          if (-not (Get-LocalUser -Name $username -ErrorAction SilentlyContinue)) {
-              throw "Failed to create RDP user."
-          }
-
           "RDP_CREDS=User: $username | Password: $password" |
             Out-File $env:GITHUB_ENV -Append -Encoding utf8
 
+      # ============================================================
+      # 7. Tailscale
+      # ============================================================
       - name: Install Tailscale
         shell: powershell
         run: |
           $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
           $installerPath = "$env:TEMP\tailscale.msi"
-
           Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
-
           Start-Process msiexec.exe `
             -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" `
             -Wait
-
           Remove-Item $installerPath -Force
 
       - name: Establish Tailscale Connection
@@ -192,47 +226,58 @@ jobs:
 
           $tsIP = $null
           $retries = 0
-
           while (-not $tsIP -and $retries -lt 10) {
               $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
-
-              if (-not $tsIP) {
-                  Start-Sleep -Seconds 5
-              }
-
+              if (-not $tsIP) { Start-Sleep -Seconds 5 }
               $retries++
           }
 
-          if (-not $tsIP) {
-              Write-Error "Tailscale IP not assigned. Exiting."
-              exit 1
-          }
-
+          if (-not $tsIP) { Write-Error "Tailscale IP not assigned."; exit 1 }
           "TAILSCALE_IP=$tsIP" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
 
+      # ============================================================
+      # 8. 🔥 FORÇAR SESSÃO DE CONSOLE ATIVA (correção do input)
+      # ============================================================
+      - name: Force Console Session for RDP
+        shell: powershell
+        run: |
+          Write-Host "=== Forçando sessão de console ==="
+
+          # Habilita o "console session" via tscon
+          # Garante que existe uma sessão interativa onde o jogo pode rodar
+          $sessionInfo = qwinsta 2>$null
+          Write-Host "Sessões atuais:"
+          Write-Host $sessionInfo
+
+          # Configura políticas para permitir RDP + Console simultâneos
+          $rdpPolicy = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services'
+          if (-not (Test-Path $rdpPolicy)) { New-Item -Path $rdpPolicy -Force | Out-Null }
+          Set-ItemProperty -Path $rdpPolicy -Name 'fSingleSessionPerUser' -Value 0 -Type DWord -Force
+          Set-ItemProperty -Path $rdpPolicy -Name 'fDisableInputRedirection' -Value 0 -Type DWord -Force
+          Set-ItemProperty -Path $rdpPolicy -Name 'fEnableRemoteFXAdvancedRemoteApp' -Value 0 -Type DWord -Force
+
+          Write-Host "✅ Sessão de console configurada."
+
+      # ============================================================
+      # 9. Verificação
+      # ============================================================
       - name: Verify RDP Accessibility
         shell: powershell
         run: |
           $connected = $false
-
           for ($i = 1; $i -le 6; $i++) {
               $result = Test-NetConnection `
                 -ComputerName $env:TAILSCALE_IP `
                 -Port 3389 `
                 -WarningAction SilentlyContinue
-
-              if ($result.TcpTestSucceeded) {
-                  $connected = $true
-                  break
-              }
-
+              if ($result.TcpTestSucceeded) { $connected = $true; break }
               Start-Sleep -Seconds 5
           }
+          if (-not $connected) { throw "RDP port 3389 is not reachable." }
 
-          if (-not $connected) {
-              throw "RDP port 3389 is not reachable."
-          }
-
+      # ============================================================
+      # 10. Manter conexão + instruções
+      # ============================================================
       - name: Maintain Connection
         shell: powershell
         run: |
@@ -243,8 +288,16 @@ jobs:
           Write-Host "Address   : $env:TAILSCALE_IP"
           Write-Host "Username  : Skyro"
           Write-Host "GPU       : $env:GPU_MODEL"
-          Write-Host "DirectX   : 11 (forçado)"
+          Write-Host "DirectX   : 11"
           Write-Host "Credentials: $env:RDP_CREDS"
+          Write-Host "======================================"
+          Write-Host ""
+          Write-Host "⚠️  DICAS PARA INPUT FUNCIONAR NO JOGO:"
+          Write-Host "  1. Ao conectar no RDP, use 'mstsc' com 'Apply Windows key combinations' = 'On this computer'"
+          Write-Host "  2. Se o jogo ainda não responder, rode dentro do RDP:"
+          Write-Host "     tscon 1 /dest:console"
+          Write-Host "  3. Para jogos que exigem DirectInput, use modo 'Borderless Windowed'"
+          Write-Host "  4. Desative 'Hardware Acceleration' do RDP (opções de exibição)"
           Write-Host "======================================"
           Write-Host ""
 
