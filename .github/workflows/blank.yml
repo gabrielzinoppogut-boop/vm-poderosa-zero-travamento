@@ -1,44 +1,61 @@
-name: Windows Cloud PC — Tailscale + RDP + RTX 3060 + DX11
+name: Máquina Windows Online — Tailscale + RDP + RTX 3060 + DX11
 
 on:
   workflow_dispatch:
+    inputs:
+      senha_rdp:
+        description: 'Senha do usuário dev (deixe vazio para usar a padrão)'
+        required: false
+        default: ''
 
 jobs:
-  build:
-    name: Iniciando Sistema Reforçado (Tailscale + RDP)
+  maquina:
+    name: Iniciando Máquina Online
     runs-on: windows-latest
-    timeout-minutes: 10080   # 7 dias
+    timeout-minutes: 360   # 6h (limite real da conta grátis)
 
     env:
-      # Força Node 24 (elimina o aviso de deprecation do Node 20)
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
       PROCESSOR_COUNT: 8
-      OPENGL: "1"
-      GITHUB_PRESERVE_WORKFLOW: true
       MEMORY_GB: 16
+      OPENGL: "1"
 
     steps:
       # ============================================================
-      # 1. INFORMAÇÕES DO RUNNER
+      # 1. DIAGNÓSTICO INICIAL
       # ============================================================
       - name: Diagnóstico do runner
         run: |
           Write-Host "===== SISTEMA ====="
-          Get-ComputerInfo | Select-Object WindowsProductName, WindowsVersion, OsArchitecture, CsProcessors, CsTotalPhysicalMemory
-          Write-Host "`n===== GPU (WMI) ====="
-          Get-CimInstance Win32_VideoController | Select-Object Name, DriverVersion, AdapterRAM
+          Get-ComputerInfo | Select-Object WindowsProductName, WindowsVersion, OsArchitecture
+          Write-Host "`n===== CPU ====="
+          Get-CimInstance Win32_Processor | Select-Object Name, NumberOfCores, NumberOfLogicalProcessors
+          Write-Host "`n===== MEMÓRIA ====="
+          Get-CimInstance Win32_PhysicalMemory | Select-Object Capacity, Speed
+          Write-Host "`n===== GPU ====="
+          Get-CimInstance Win32_VideoController | Select-Object Name, DriverVersion
 
       # ============================================================
-      # 2. HABILITAR ÁREA DE TRABALHO REMOTA (RDP)
+      # 2. HABILITAR RDP + CRIAR USUÁRIO
       # ============================================================
-      - name: Habilitar RDP no Windows
+      - name: Habilitar RDP e criar usuário
         run: |
           Write-Host "-> Habilitando Remote Desktop..."
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+            -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name "UserAuthentication" -Value 0 -Force
 
-          Write-Host "-> Criando usuário 'dev' com senha forte..."
-          $senha = ConvertTo-SecureString "Dev@RTX3060!2026" -AsPlainText -Force
+          Write-Host "-> Liberando porta 3389 (RDP)..."
+          New-NetFirewallRule -DisplayName "RDP-Tailscale" -Direction Inbound `
+            -Protocol TCP -LocalPort 3389 -Action Allow -ErrorAction SilentlyContinue
+
+          Write-Host "-> Criando usuário 'dev'..."
+          $senhaTexto = "${{ github.event.inputs.senha_rdp }}"
+          if (-not $senhaTexto) { $senhaTexto = "${{ secrets.RDP_PASSWORD }}" }
+          if (-not $senhaTexto) { $senhaTexto = "Dev@RTX3060!2026" }
+
+          $senha = ConvertTo-SecureString $senhaTexto -AsPlainText -Force
           New-LocalUser -Name "dev" -Password $senha -PasswordNeverExpires -ErrorAction SilentlyContinue
           Add-LocalGroupMember -Group "Administradores" -Member "dev" -ErrorAction SilentlyContinue
           Add-LocalGroupMember -Group "Administrators" -Member "dev" -ErrorAction SilentlyContinue
@@ -51,13 +68,14 @@ jobs:
       - name: Instalar Tailscale
         run: |
           Write-Host "-> Baixando Tailscale..."
-          $url = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
-          Invoke-WebRequest -Uri $url -OutFile "$env:TEMP\tailscale.msi" -UseBasicParsing
+          Invoke-WebRequest -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" `
+            -OutFile "$env:TEMP\tailscale.msi" -UseBasicParsing
 
-          Write-Host "-> Instalando Tailscale silenciosamente..."
-          Start-Process msiexec.exe -ArgumentList "/i `"$env:TEMP\tailscale.msi`" /quiet /norestart" -Wait
+          Write-Host "-> Instalando silenciosamente..."
+          Start-Process msiexec.exe `
+            -ArgumentList "/i `"$env:TEMP\tailscale.msi`" /quiet /norestart" -Wait
 
-          Write-Host "-> Verificando instalação..."
+          Write-Host "-> Versão instalada:"
           & "C:\Program Files\Tailscale\tailscale.exe" version
 
       # ============================================================
@@ -65,34 +83,35 @@ jobs:
       # ============================================================
       - name: Conectar à Tailscale
         env:
-          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+          TS_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
         run: |
-          if (-not $env:TAILSCALE_AUTHKEY) {
-            Write-Host "❌ ERRO: secret TAILSCALE_AUTHKEY não configurado!"
-            Write-Host "Vá em: Settings → Secrets and variables → Actions → New repository secret"
-            Write-Host "Crie: TAILSCALE_AUTHKEY = sua chave gerada em https://login.tailscale.com/admin/settings/keys"
+          if (-not $env:TS_AUTHKEY) {
+            Write-Host "❌ Secret TAILSCALE_AUTHKEY não configurado!"
+            Write-Host "Settings → Secrets and variables → Actions → New secret"
             exit 1
           }
 
-          Write-Host "-> Conectando Tailscale..."
-          & "C:\Program Files\Tailscale\tailscale.exe" up --authkey=$env:TAILSCALE_AUTHKEY --hostname=rtx3060-cloud --accept-routes --advertise-tags=tag:ci
+          Write-Host "-> Autenticando..."
+          & "C:\Program Files\Tailscale\tailscale.exe" up `
+            --authkey="$env:TS_AUTHKEY" `
+            --hostname="rtx3060-cloud-${{ github.run_id }}" `
+            --accept-routes `
+            --unattended
 
-          Write-Host "-> Status da Tailscale:"
+          Start-Sleep -Seconds 5
+
+          Write-Host "`n===== STATUS ====="
           & "C:\Program Files\Tailscale\tailscale.exe" status
 
-          Write-Host "-> IP Tailscale desta máquina:"
           $ip = & "C:\Program Files\Tailscale\tailscale.exe" ip -4
-          Write-Host "🌐 IP: $ip" 
-          Write-Host "🌐 Use esse IP no RDP: mstsc.exe /v:$ip"
+          Write-Host "`n🌐 IP TAILSCALE: $ip"
 
       # ============================================================
-      # 5. OTIMIZAÇÕES RTX 3060 + DIRECTX 11
+      # 5. OTIMIZAÇÕES RTX 3060 + DX11
       # ============================================================
-      - name: Otimizar performance (RTX 3060 + DX11)
+      - name: Otimizar RTX 3060 + DirectX 11
         continue-on-error: true
         run: |
-          Write-Host "===== OTIMIZAÇÕES ====="
-
           Write-Host "-> Plano de energia ALTO DESEMPENHO..."
           powercfg /setactive SCHEME_MIN
 
@@ -103,74 +122,87 @@ jobs:
             -Value "VRROptimizeEnable=0;SwapEffectUpgradeEnable=1;" -Force
 
           Write-Host "-> Verificando DLLs do DirectX 11..."
-          $dxFiles = @(
-            "C:\Windows\System32\d3d11.dll",
-            "C:\Windows\System32\dxgi.dll",
-            "C:\Windows\System32\d3dcompiler_47.dll"
-          )
-          foreach ($f in $dxFiles) {
-            if (Test-Path $f) {
-              Write-Host "[OK] $(Split-Path $f -Leaf)"
-            } else {
-              Write-Host "[FALTA] $(Split-Path $f -Leaf)"
-            }
+          @("d3d11.dll","dxgi.dll","d3dcompiler_47.dll") | ForEach-Object {
+            $p = "C:\Windows\System32\$_"
+            if (Test-Path $p) { Write-Host "[OK] $_" } else { Write-Host "[FALTA] $_" }
           }
 
-          Write-Host "-> Telemetria off (DiagTrack)..."
+          Write-Host "-> Telemetria off..."
           Stop-Service -Name "DiagTrack" -Force -ErrorAction SilentlyContinue
           Set-Service  -Name "DiagTrack" -StartupType Disabled -ErrorAction SilentlyContinue
 
           Write-Host "[OK] Otimizações aplicadas."
 
       # ============================================================
-      # 6. MOSTRAR INFORMAÇÕES DE CONEXÃO
+      # 6. MOSTRAR DADOS DE CONEXÃO
       # ============================================================
       - name: Mostrar dados de conexão
         run: |
           $ip = & "C:\Program Files\Tailscale\tailscale.exe" ip -4
           Write-Host "================================================"
-          Write-Host "  🔗 CONEXÃO RDP PRONTA"
+          Write-Host "  🔗 MÁQUINA ONLINE — CONECTE AGORA"
           Write-Host "================================================"
           Write-Host "  IP Tailscale : $ip"
           Write-Host "  Usuário      : dev"
-          Write-Host "  Senha        : Dev@RTX3060!2026"
-          Write-Host "  Porta        : 3389"
+          Write-Host "  Senha        : (a que você definiu)"
+          Write-Host "  Porta RDP    : 3389"
           Write-Host ""
-          Write-Host "  No seu PC (com Tailscale logado), rode:"
+          Write-Host "  No seu PC (com Tailscale logado):"
           Write-Host "     mstsc.exe /v:$ip"
           Write-Host "================================================"
 
       # ============================================================
-      # 7. MONITORAMENTO CONTÍNUO (mantém RDP + Tailscale vivos)
+      # 7. MONITORAMENTO CONTÍNUO — MANTÉM A MÁQUINA ONLINE
       # ============================================================
-      - name: Monitoramento Contínuo
+      - name: Monitoramento Contínuo (mantém online)
         run: |
+          Write-Host "🔄 Iniciando monitoramento contínuo..."
+          Write-Host "   A máquina ficará online enquanto este step rodar."
+          Write-Host ""
+
+          $contador = 0
           while ($true) {
-              # Garante que o RDP está ativo
-              $rdp = (Get-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections").fDenyTSConnections
+              $contador++
+
+              # Verifica RDP
+              $rdp = (Get-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+                -Name "fDenyTSConnections" -ErrorAction SilentlyContinue).fDenyTSConnections
               if ($rdp -ne 0) {
-                  Write-Host "⚠️ RDP caiu — reabilitando..."
-                  Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
+                  Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+                    -Name "fDenyTSConnections" -Value 0 -Force
+                  Write-Host "⚠️ RDP reabilitado."
               }
 
-              # Garante que Tailscale está rodando
+              # Verifica serviço do RDP
+              $svcRdp = Get-Service -Name "TermService" -ErrorAction SilentlyContinue
+              if ($svcRdp -and $svcRdp.Status -ne "Running") {
+                  Start-Service -Name "TermService" -ErrorAction SilentlyContinue
+                  Write-Host "⚠️ TermService reiniciado."
+              }
+
+              # Verifica Tailscale
               $ts = Get-Process -Name "tailscaled" -ErrorAction SilentlyContinue
               if (-not $ts) {
                   Write-Host "⚠️ Tailscale caiu — reiniciando..."
                   Restart-Service -Name "Tailscale" -Force -ErrorAction SilentlyContinue
+                  Start-Sleep -Seconds 5
+                  & "C:\Program Files\Tailscale\tailscale.exe" up `
+                    --authkey="$env:TS_AUTHKEY" --unattended 2>$null
               }
 
               $ip = & "C:\Program Files\Tailscale\tailscale.exe" ip -4 2>$null
-              Write-Host "[$(Get-Date -Format 'HH:mm:ss')] ✅ Online — IP: $ip"
+              $uptime = [math]::Round($contador, 0)
+              Write-Host "[$(Get-Date -Format 'HH:mm:ss')] ✅ Online há $uptime min — IP: $ip"
 
               Start-Sleep -Seconds 60
           }
 
       # ============================================================
-      # 8. LIMPEZA
+      # 8. LIMPEZA (só roda se algo der errado)
       # ============================================================
       - name: Limpeza Segura
         if: always()
         run: |
+          & "C:\Program Files\Tailscale\tailscale.exe" down 2>$null
           Remove-Item "$env:TEMP\tailscale.msi" -Force -ErrorAction SilentlyContinue
           Write-Host "Limpeza finalizada."
