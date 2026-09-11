@@ -168,44 +168,69 @@ jobs:
           Remove-Item $installerPath -Force
           Write-Host "Tailscale instalado"
 
-      - name: Conectar ao Tailscale
-        uses: tailscale/github-action@v3
-        with:
-          authkey: ${{ secrets.TAILSCALE_AUTH_KEY }}
-          tags: tag:ci
-          version: latest
-
-      - name: Obter IP do Tailscale
+      - name: Autenticar Tailscale e Mostrar Link
         shell: powershell
         run: |
-          Write-Host "OBTENDO IP DO TAILSCALE"
+          Write-Host "=========================================="
+          Write-Host "  AUTENTICANDO TAILSCALE"
+          Write-Host "=========================================="
+          Write-Host ""
           
           $tailscaleExe = "$env:ProgramFiles\Tailscale\tailscale.exe"
           
-          # Aguardar IP estar disponivel
-          $tsIP = $null
-          $retries = 0
-          while (-not $tsIP -and $retries -lt 20) {
-              Start-Sleep -Seconds 3
-              try {
-                  $tsIP = & $tailscaleExe ip -4 2>$null
-                  if ($tsIP) {
-                      $tsIP = $tsIP.Trim()
-                  }
-              } catch {
-                  $tsIP = $null
+          # Executar tailscale up e capturar saida
+          $output = & $tailscaleExe up --hostname="win-full-$env:GITHUB_RUN_ID" 2>&1
+          
+          # Procurar por link de autenticacao
+          $authLink = ""
+          foreach ($line in $output) {
+              Write-Host $line
+              if ($line -match "https://login\.tailscale\.com") {
+                  $authLink = $line.Trim()
               }
-              $retries++
           }
           
-          if ($tsIP) {
-              echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
-              Write-Host "=========================================="
-              Write-Host "IP DO TAILSCALE: $tsIP"
-              Write-Host "=========================================="
-          } else {
+          # Mostrar link destacado
+          if ($authLink) {
+              Write-Host ""
+              Write-Host "##########################################"
+              Write-Host "# LINK DE VERIFICACAO DO TAILSCALE:      #"
+              Write-Host "##########################################"
+              Write-Host ""
+              Write-Host "$authLink"
+              Write-Host ""
+              Write-Host "##########################################"
+              Write-Host ""
+              Write-Host "1. Copie o link acima"
+              Write-Host "2. Abra no navegador do celular ou PC"
+              Write-Host "3. Faca login no Tailscale"
+              Write-Host "4. Autorize o dispositivo"
+              Write-Host ""
+          }
+          
+          # Aguardar autenticacao
+          Write-Host "Aguardando autenticacao (2 minutos)..."
+          $authenticated = $false
+          $startTime = Get-Date
+          
+          while (((Get-Date) - $startTime).TotalSeconds -lt 120) {
+              $tsIP = & $tailscaleExe ip -4 2>$null
+              if ($tsIP -and $tsIP.Trim() -ne "") {
+                  $authenticated = $true
+                  echo "TAILSCALE_IP=$($tsIP.Trim())" >> $env:GITHUB_ENV
+                  Write-Host ""
+                  Write-Host "AUTENTICADO COM SUCESSO!"
+                  Write-Host "IP: $tsIP"
+                  break
+              }
+              Start-Sleep -Seconds 5
+              $elapsed = [math]::Round(((Get-Date) - $startTime).TotalSeconds)
+              Write-Host "Aguardando... $elapsed segundos"
+          }
+          
+          if (-not $authenticated) {
+              Write-Host "Autenticacao nao completada"
               echo "TAILSCALE_IP=localhost" >> $env:GITHUB_ENV
-              Write-Host "IP nao obtido, usando localhost"
           }
 
       - name: Iniciar Sunshine
@@ -234,9 +259,6 @@ jobs:
           Write-Host "   WINDOWS 10 COMPLETO - RTX 3060"
           Write-Host "=========================================="
           Write-Host ""
-          Write-Host "INFORMACOES DE CONEXAO:"
-          Write-Host "=========================================="
-          Write-Host ""
           Write-Host "PARA RDP:"
           Write-Host "IP: $env:TAILSCALE_IP"
           Write-Host "Usuario: RDP"
@@ -246,20 +268,10 @@ jobs:
           Write-Host "IP: $env:TAILSCALE_IP"
           Write-Host "Porta: 47989"
           Write-Host ""
-          Write-Host "PARA SUNSHINE WEB:"
-          Write-Host "URL: https://$env:TAILSCALE_IP`:47989"
-          Write-Host ""
           Write-Host "PARA WIRELESS DISPLAY (TV):"
           Write-Host "Pressione Win+K no Windows"
           Write-Host ""
-          Write-Host "CONFIGURACAO:"
-          Write-Host "GPU: RTX 3060"
-          Write-Host "DirectX: 11"
-          Write-Host "Refresh: ${{ github.event.inputs.refresh_rate }}Hz"
-          Write-Host "Resolucao: ${{ github.event.inputs.resolution }}"
-          Write-Host ""
           Write-Host "=========================================="
-          
           $counter = 0
           while ($true) {
               $counter++
