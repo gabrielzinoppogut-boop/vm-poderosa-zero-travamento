@@ -15,16 +15,21 @@ on:
   push:
     branches: [ main, master ]
   schedule:
-    - cron: '0 3 * * 0'   # Todo domingo às 03:00 UTC
+    - cron: '0 3 * * 0'
 
-permissions:
-  contents: read
-
+# ============================================================
+# FORÇA TODAS AS ACTIONS A RODAR EM NODE 24
+# (elimina o aviso "Node 20 is being deprecated")
+# ============================================================
 env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
   PYTHON_VERSION: '3.11'
   PYTHONUNBUFFERED: '1'
   PYTHONDONTWRITEBYTECODE: '1'
-  LOG_DIR: '${{ github.workspace }}\\logs'
+  LOG_DIR: '${{ github.workspace }}\logs'
+
+permissions:
+  contents: read
 
 jobs:
   diagnostico-windows:
@@ -44,13 +49,14 @@ jobs:
         uses: actions/checkout@v4
 
       # ============================================================
-      # 2. SETUP PYTHON
+      # 2. SETUP PYTHON (SEM cache: 'pip' para evitar o erro)
       # ============================================================
       - name: Configurar Python ${{ env.PYTHON_VERSION }}
         uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
-          cache: 'pip'
+          # cache: 'pip'  <-- REMOVIDO: era isso que quebrava quando
+          #                  não existe requirements.txt / pyproject.toml
 
       - name: Instalar dependências
         run: |
@@ -81,9 +87,8 @@ jobs:
             & $smi --query-gpu=name,driver_version,memory.total,temperature.gpu,utilization.gpu,power.draw --format=csv
             Write-Host "[OK] nvidia-smi executado com sucesso"
           } else {
-            Write-Host "[AVISO] nvidia-smi não disponível neste runner (esperado em runner GitHub)."
+            Write-Host "[AVISO] nvidia-smi não disponível neste runner."
           }
-
           Write-Host "`n===== GPUs detectadas via WMI ====="
           Get-CimInstance Win32_VideoController | Select-Object Name, DriverVersion, AdapterRAM, VideoProcessor
 
@@ -94,7 +99,6 @@ jobs:
         continue-on-error: true
         run: |
           Write-Host "===== VERIFICAÇÃO DIRECTX ====="
-
           $dxKeys = @(
             "HKLM:\SOFTWARE\Microsoft\DirectX",
             "HKLM:\SOFTWARE\WOW6432Node\Microsoft\DirectX"
@@ -105,7 +109,6 @@ jobs:
                 Select-Object Version, InstalledVersion
             }
           }
-
           Write-Host "`n===== DLLs DirectX 11 ====="
           $dxFiles = @(
             "C:\Windows\System32\d3d11.dll",
@@ -130,34 +133,27 @@ jobs:
         continue-on-error: true
         run: |
           Write-Host "===== OTIMIZAÇÕES DE PERFORMANCE ====="
-
-          # Plano de energia alto desempenho
           Write-Host "-> Ativando plano de energia ALTO DESEMPENHO..."
           powercfg /setactive SCHEME_MIN
           powercfg /list
 
-          # Prioridade de GPU DirectX 11
           Write-Host "-> Ajustando prioridade DirectX 11..."
           $dxReg = "HKCU:\Software\Microsoft\DirectX\UserGpuPreferences"
           if (-not (Test-Path $dxReg)) { New-Item -Path $dxReg -Force | Out-Null }
           Set-ItemProperty -Path $dxReg -Name "DirectXUserGlobalSettings" `
             -Value "VRROptimizeEnable=0;SwapEffectUpgradeEnable=1;" -Force
 
-          # Desativar indexação em background
           Write-Host "-> Reduzindo indexação..."
           Set-Service -Name "WSearch" -StartupType Manual -ErrorAction SilentlyContinue
 
-          # Desativar telemetria (DiagTrack)
           Write-Host "-> Desativando telemetria..."
           Stop-Service -Name "DiagTrack" -Force -ErrorAction SilentlyContinue
           Set-Service  -Name "DiagTrack" -StartupType Disabled -ErrorAction SilentlyContinue
 
-          # Otimizar Prefetch
           Write-Host "-> Otimizando Prefetch..."
           $pref = "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management\PrefetchParameters"
           Set-ItemProperty -Path $pref -Name "EnablePrefetcher" -Value 3 -Type DWord -Force
 
-          # Prioridade multimídia / GPU
           Write-Host "-> Ajustando prioridade multimídia..."
           $mm = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile"
           Set-ItemProperty -Path $mm -Name "SystemResponsiveness" -Value 0 -Type DWord -Force
@@ -207,7 +203,7 @@ jobs:
           Write-Host "[OK] $iter ciclos em $([math]::Round($sw.Elapsed.TotalSeconds,2))s (checksum=$sum)"
 
       # ============================================================
-      # 9. RELATÓRIO FINAL
+      # 9. RELATÓRIO FINAL + UPLOAD
       # ============================================================
       - name: Gerar relatório final
         if: always()
@@ -223,6 +219,7 @@ jobs:
           Modo          : ${{ github.event.inputs.modo }}
           Commit        : ${{ github.sha }}
           Repositório   : ${{ github.repository }}
+          Node Runtime  : Node 24 (forçado)
           ============================================================
           "@ | Out-File -FilePath $relatorio -Encoding UTF8
           Get-Content $relatorio
