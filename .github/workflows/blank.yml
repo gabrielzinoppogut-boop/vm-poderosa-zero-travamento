@@ -1,282 +1,236 @@
-name: Windows 10 Completo com RTX 3060
+name: Diagnóstico e Otimização — RTX 3060 + DirectX 11
 
 on:
   workflow_dispatch:
     inputs:
-      refresh_rate:
-        description: 'Taxa de Atualizacao'
+      modo:
+        description: 'Modo de execução'
         required: true
-        default: '60'
+        default: 'completo'
         type: choice
         options:
-          - '60'
-          - '75'
-          - '120'
-          - '144'
-      resolution:
-        description: 'Resolucao'
-        required: true
-        default: '1920x1080'
-        type: choice
-        options:
-          - '1280x720'
-          - '1920x1080'
-          - '2560x1440'
+          - completo
+          - somente-diagnostico
+          - somente-otimizacao
+  push:
+    branches: [ main, master ]
+  schedule:
+    - cron: '0 3 * * 0'   # Todo domingo às 03:00 UTC
+
+permissions:
+  contents: read
+
+env:
+  PYTHON_VERSION: '3.11'
+  PYTHONUNBUFFERED: '1'
+  PYTHONDONTWRITEBYTECODE: '1'
+  LOG_DIR: '${{ github.workspace }}\\logs'
 
 jobs:
-  windows-complete:
+  diagnostico-windows:
+    name: Executar em Windows (RTX 3060 / DX11)
     runs-on: windows-latest
-    timeout-minutes: 3600
+    timeout-minutes: 30
+
+    defaults:
+      run:
+        shell: pwsh
 
     steps:
-      - name: Verificar Sistema
-        shell: powershell
-        run: |
-          Write-Host "=========================================="
-          Write-Host "  VERIFICANDO SISTEMA"
-          Write-Host "=========================================="
-          $ram = [math]::Round((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB, 2)
-          $cpu = (Get-CimInstance Win32_Processor).Name
-          Write-Host "RAM: $ram GB"
-          Write-Host "CPU: $cpu"
-          Write-Host "=========================================="
+      # ============================================================
+      # 1. CHECKOUT
+      # ============================================================
+      - name: Checkout do repositório
+        uses: actions/checkout@v4
 
-      - name: Instalar Chocolatey
-        shell: powershell
-        run: |
-          Write-Host "INSTALANDO CHOCOLATEY"
-          Set-ExecutionPolicy Bypass -Scope Process -Force
-          [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor 3072
-          Invoke-Expression ((New-Object System.Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))
-          Write-Host "Chocolatey instalado"
+      # ============================================================
+      # 2. SETUP PYTHON
+      # ============================================================
+      - name: Configurar Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
 
-      - name: Habilitar Wireless Display e Cast
-        shell: powershell
+      - name: Instalar dependências
         run: |
-          Write-Host "HABILITANDO WIRELESS DISPLAY E CAST"
-          Add-WindowsCapability -Online -Name "App.WirelessDisplay.Connect~~~~0.0.1.0" -ErrorAction SilentlyContinue
-          New-Item -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Cast" -Force -ErrorAction SilentlyContinue
-          New-Item -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Projection" -Force -ErrorAction SilentlyContinue
-          Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Cast" -Name "EnableCast" -Value "1" -Force -ErrorAction SilentlyContinue
-          Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Cast" -Name "CastEnabled" -Value "1" -Force -ErrorAction SilentlyContinue
-          Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Projection" -Name "ProjectionEnabled" -Value "1" -Force -ErrorAction SilentlyContinue
-          Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\GraphicsDrivers" -Name "HwSchMode" -Value "2" -Force -ErrorAction SilentlyContinue
-          netsh advfirewall firewall add rule name="WiDi-TCP" dir=in action=allow protocol=TCP localport=7250 2>$null
-          netsh advfirewall firewall add rule name="WiDi-UDP" dir=in action=allow protocol=UDP localport=5353 2>$null
-          netsh advfirewall firewall add rule name="WiDi-RTP" dir=in action=allow protocol=UDP localport=50000-50100 2>$null
-          Write-Host "Wireless Display e Cast habilitados"
+          python -m pip install --upgrade pip
+          pip install psutil colorama
 
-      - name: Habilitar DLNA
-        shell: powershell
+      # ============================================================
+      # 3. INFORMAÇÕES DO SISTEMA
+      # ============================================================
+      - name: Coletar informações do sistema
         run: |
-          Write-Host "HABILITANDO DLNA"
-          Set-Service -Name "WMPNetworkSvc" -StartupType Automatic -ErrorAction SilentlyContinue
-          Start-Service -Name "WMPNetworkSvc" -ErrorAction SilentlyContinue
-          netsh advfirewall firewall set rule group="Descoberta de Rede" new enable=Yes 2>$null
-          netsh advfirewall firewall set rule group="Compartilhamento de Arquivo e Impressora" new enable=Yes 2>$null
-          netsh advfirewall firewall add rule name="DLNA-TCP" dir=in action=allow protocol=TCP localport=2869 2>$null
-          netsh advfirewall firewall add rule name="DLNA-UDP" dir=in action=allow protocol=UDP localport=1900 2>$null
-          netsh advfirewall firewall add rule name="DLNA-HTTP" dir=in action=allow protocol=TCP localport=10243 2>$null
-          Write-Host "DLNA configurado"
+          Write-Host "===== INFORMAÇÕES DO SISTEMA ====="
+          Get-ComputerInfo | Select-Object WindowsProductName, WindowsVersion, OsArchitecture, CsProcessors, CsTotalPhysicalMemory
+          Write-Host "`n===== CPU ====="
+          Get-CimInstance Win32_Processor | Select-Object Name, NumberOfCores, NumberOfLogicalProcessors, MaxClockSpeed
+          Write-Host "`n===== MEMÓRIA ====="
+          Get-CimInstance Win32_PhysicalMemory | Select-Object Capacity, Speed, Manufacturer
 
-      - name: Instalar Sunshine
-        shell: powershell
+      # ============================================================
+      # 4. VERIFICAÇÃO DA GPU (RTX 3060)
+      # ============================================================
+      - name: Verificar GPU RTX 3060
+        continue-on-error: true
         run: |
-          Write-Host "INSTALANDO SUNSHINE"
-          choco install sunshine -y --no-progress
-          Write-Host "Sunshine instalado"
-
-      - name: Configurar Portas do Firewall
-        shell: powershell
-        run: |
-          Write-Host "CONFIGURANDO FIREWALL"
-          $tcpPorts = @(47984, 47989, 48010, 3389, 2869, 10243, 7250)
-          foreach ($port in $tcpPorts) {
-              netsh advfirewall firewall delete rule name="Sunshine-TCP-$port" 2>$null
-              netsh advfirewall firewall add rule name="Sunshine-TCP-$port" dir=in action=allow protocol=TCP localport=$port 2>$null
-          }
-          $udpPorts = @(47998, 47999, 48000, 48002, 48010, 1900, 5353)
-          foreach ($port in $udpPorts) {
-              netsh advfirewall firewall delete rule name="Sunshine-UDP-$port" 2>$null
-              netsh advfirewall firewall add rule name="Sunshine-UDP-$port" dir=in action=allow protocol=UDP localport=$port 2>$null
-          }
-          netsh advfirewall firewall add rule name="RDP" dir=in action=allow protocol=TCP localport=3389 2>$null
-          Write-Host "Firewall configurado"
-
-      - name: Habilitar RDP
-        shell: powershell
-        run: |
-          Write-Host "HABILITANDO RDP"
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
-          Restart-Service -Name TermService -Force
-          Write-Host "RDP habilitado"
-
-      - name: Configurar Para RTX 3060 e DirectX 11
-        shell: powershell
-        run: |
-          Write-Host "CONFIGURANDO PARA RTX 3060"
-          Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\GraphicsDrivers" -Name "HwSchMode" -Value "2" -Force -ErrorAction SilentlyContinue
-          Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\GraphicsDrivers" -Name "TdrLevel" -Value "0" -Force -ErrorAction SilentlyContinue
-          Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\GraphicsDrivers" -Name "TdrDelay" -Value "10" -Force -ErrorAction SilentlyContinue
-          Set-ItemProperty -Path "HKCU:\Software\Microsoft\GameBar" -Name "AutoGameModeEnabled" -Value "1" -Force -ErrorAction SilentlyContinue
-          Set-ItemProperty -Path "HKCU:\Software\Microsoft\GameBar" -Name "AllowAutoGameMode" -Value "1" -Force -ErrorAction SilentlyContinue
-          Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Power\PowerThrottling" -Name "PowerThrottlingOff" -Value "1" -Force -ErrorAction SilentlyContinue
-          Write-Host "Configurado para RTX 3060 e DirectX 11"
-
-      - name: Otimizar Sistema
-        shell: powershell
-        run: |
-          Write-Host "OTIMIZANDO SISTEMA"
-          $servicesToDisable = @(
-              "DiagTrack", "dmwappushservice", "MapsBroker", "lfsvc",
-              "WSearch", "WMPNetworkSvc", "XboxGipSvc", "XblAuthManager",
-              "XblGameSave", "XboxNetApiSvc", "RetailDemo", "RemoteRegistry"
-          )
-          foreach ($service in $servicesToDisable) {
-              Stop-Service -Name $service -Force -ErrorAction SilentlyContinue
-              Set-Service -Name $service -StartupType Disabled -ErrorAction SilentlyContinue
-          }
-          Remove-Item -Path "$env:TEMP\*" -Recurse -Force -ErrorAction SilentlyContinue
-          Remove-Item -Path "C:\Windows\Temp\*" -Recurse -Force -ErrorAction SilentlyContinue
-          Write-Host "Sistema otimizado"
-
-      - name: Criar Usuario
-        shell: powershell
-        run: |
-          Write-Host "CRIANDO USUARIO"
-          Add-Type -AssemblyName System.Web
-          $password = [System.Web.Security.Membership]::GeneratePassword(16, 4)
-          $password = "Aa1!" + $password.Substring(0, [Math]::Min(12, $password.Length))
-          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
-          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires -PasswordNeverExpires
-          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
-          echo "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
-          echo "RDP_USERNAME=RDP" >> $env:GITHUB_ENV
-          Write-Host "Usuario criado"
-          Write-Host "Senha: $password"
-
-      - name: Instalar Tailscale
-        shell: powershell
-        run: |
-          Write-Host "INSTALANDO TAILSCALE"
-          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
-          $installerPath = "$env:TEMP\tailscale.msi"
-          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
-          Start-Process msiexec.exe -ArgumentList "/i $installerPath /quiet /norestart" -Wait
-          Remove-Item $installerPath -Force
-          Write-Host "Tailscale instalado"
-
-      - name: Autenticar Tailscale e Mostrar Link
-        shell: powershell
-        run: |
-          Write-Host "=========================================="
-          Write-Host "  AUTENTICANDO TAILSCALE"
-          Write-Host "=========================================="
-          Write-Host ""
-          
-          $tailscaleExe = "$env:ProgramFiles\Tailscale\tailscale.exe"
-          
-          # Executar tailscale up e capturar saida
-          $output = & $tailscaleExe up --hostname="win-full-$env:GITHUB_RUN_ID" 2>&1
-          
-          # Procurar por link de autenticacao
-          $authLink = ""
-          foreach ($line in $output) {
-              Write-Host $line
-              if ($line -match "https://login\.tailscale\.com") {
-                  $authLink = $line.Trim()
-              }
-          }
-          
-          # Mostrar link destacado
-          if ($authLink) {
-              Write-Host ""
-              Write-Host "##########################################"
-              Write-Host "# LINK DE VERIFICACAO DO TAILSCALE:      #"
-              Write-Host "##########################################"
-              Write-Host ""
-              Write-Host "$authLink"
-              Write-Host ""
-              Write-Host "##########################################"
-              Write-Host ""
-              Write-Host "1. Copie o link acima"
-              Write-Host "2. Abra no navegador do celular ou PC"
-              Write-Host "3. Faca login no Tailscale"
-              Write-Host "4. Autorize o dispositivo"
-              Write-Host ""
-          }
-          
-          # Aguardar autenticacao
-          Write-Host "Aguardando autenticacao (2 minutos)..."
-          $authenticated = $false
-          $startTime = Get-Date
-          
-          while (((Get-Date) - $startTime).TotalSeconds -lt 120) {
-              $tsIP = & $tailscaleExe ip -4 2>$null
-              if ($tsIP -and $tsIP.Trim() -ne "") {
-                  $authenticated = $true
-                  echo "TAILSCALE_IP=$($tsIP.Trim())" >> $env:GITHUB_ENV
-                  Write-Host ""
-                  Write-Host "AUTENTICADO COM SUCESSO!"
-                  Write-Host "IP: $tsIP"
-                  break
-              }
-              Start-Sleep -Seconds 5
-              $elapsed = [math]::Round(((Get-Date) - $startTime).TotalSeconds)
-              Write-Host "Aguardando... $elapsed segundos"
-          }
-          
-          if (-not $authenticated) {
-              Write-Host "Autenticacao nao completada"
-              echo "TAILSCALE_IP=localhost" >> $env:GITHUB_ENV
-          }
-
-      - name: Iniciar Sunshine
-        shell: powershell
-        run: |
-          Write-Host "INICIANDO SUNSHINE"
-          $sunshinePath = "C:\Program Files\Sunshine\sunshine.exe"
-          if (-not (Test-Path $sunshinePath)) {
-              $sunshinePath = "C:\Program Files (x86)\Sunshine\sunshine.exe"
-          }
-          if (-not (Test-Path $sunshinePath)) {
-              $sunshinePath = (Get-Command sunshine -ErrorAction SilentlyContinue).Source
-          }
-          if ($sunshinePath) {
-              Start-Process $sunshinePath -WindowStyle Hidden
-              Write-Host "Sunshine iniciado"
-              Start-Sleep -Seconds 10
+          Write-Host "===== VERIFICAÇÃO DA GPU ====="
+          $smi = "C:\Windows\System32\nvidia-smi.exe"
+          if (Test-Path $smi) {
+            & $smi --query-gpu=name,driver_version,memory.total,temperature.gpu,utilization.gpu,power.draw --format=csv
+            Write-Host "[OK] nvidia-smi executado com sucesso"
           } else {
-              Write-Host "Sunshine nao encontrado"
+            Write-Host "[AVISO] nvidia-smi não disponível neste runner (esperado em runner GitHub)."
           }
 
-      - name: Manter Ativo
-        shell: powershell
+          Write-Host "`n===== GPUs detectadas via WMI ====="
+          Get-CimInstance Win32_VideoController | Select-Object Name, DriverVersion, AdapterRAM, VideoProcessor
+
+      # ============================================================
+      # 5. VERIFICAÇÃO DO DIRECTX 11
+      # ============================================================
+      - name: Verificar DirectX 11
+        continue-on-error: true
         run: |
-          Write-Host "=========================================="
-          Write-Host "   WINDOWS 10 COMPLETO - RTX 3060"
-          Write-Host "=========================================="
-          Write-Host ""
-          Write-Host "PARA RDP:"
-          Write-Host "IP: $env:TAILSCALE_IP"
-          Write-Host "Usuario: RDP"
-          Write-Host "Senha: $env:RDP_PASSWORD"
-          Write-Host ""
-          Write-Host "PARA MOONLIGHT:"
-          Write-Host "IP: $env:TAILSCALE_IP"
-          Write-Host "Porta: 47989"
-          Write-Host ""
-          Write-Host "PARA WIRELESS DISPLAY (TV):"
-          Write-Host "Pressione Win+K no Windows"
-          Write-Host ""
-          Write-Host "=========================================="
-          $counter = 0
-          while ($true) {
-              $counter++
-              Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Ativo | Check #$counter"
-              Write-Host "RDP: $env:TAILSCALE_IP`:3389"
-              Write-Host "Moonlight: $env:TAILSCALE_IP`:47989"
-              Start-Sleep -Seconds 300
+          Write-Host "===== VERIFICAÇÃO DIRECTX ====="
+
+          $dxKeys = @(
+            "HKLM:\SOFTWARE\Microsoft\DirectX",
+            "HKLM:\SOFTWARE\WOW6432Node\Microsoft\DirectX"
+          )
+          foreach ($key in $dxKeys) {
+            if (Test-Path $key) {
+              Get-ItemProperty -Path $key -ErrorAction SilentlyContinue |
+                Select-Object Version, InstalledVersion
+            }
           }
+
+          Write-Host "`n===== DLLs DirectX 11 ====="
+          $dxFiles = @(
+            "C:\Windows\System32\d3d11.dll",
+            "C:\Windows\System32\dxgi.dll",
+            "C:\Windows\System32\d3dcompiler_47.dll",
+            "C:\Windows\System32\dxva2.dll"
+          )
+          foreach ($f in $dxFiles) {
+            if (Test-Path $f) {
+              $ver = (Get-Item $f).VersionInfo.FileVersion
+              Write-Host "[OK] $(Split-Path $f -Leaf) — versão $ver"
+            } else {
+              Write-Host "[FALTA] $(Split-Path $f -Leaf)"
+            }
+          }
+
+      # ============================================================
+      # 6. OTIMIZAÇÕES DE PERFORMANCE (sem firewall, sem TV)
+      # ============================================================
+      - name: Aplicar otimizações de performance
+        if: ${{ github.event.inputs.modo != 'somente-diagnostico' }}
+        continue-on-error: true
+        run: |
+          Write-Host "===== OTIMIZAÇÕES DE PERFORMANCE ====="
+
+          # Plano de energia alto desempenho
+          Write-Host "-> Ativando plano de energia ALTO DESEMPENHO..."
+          powercfg /setactive SCHEME_MIN
+          powercfg /list
+
+          # Prioridade de GPU DirectX 11
+          Write-Host "-> Ajustando prioridade DirectX 11..."
+          $dxReg = "HKCU:\Software\Microsoft\DirectX\UserGpuPreferences"
+          if (-not (Test-Path $dxReg)) { New-Item -Path $dxReg -Force | Out-Null }
+          Set-ItemProperty -Path $dxReg -Name "DirectXUserGlobalSettings" `
+            -Value "VRROptimizeEnable=0;SwapEffectUpgradeEnable=1;" -Force
+
+          # Desativar indexação em background
+          Write-Host "-> Reduzindo indexação..."
+          Set-Service -Name "WSearch" -StartupType Manual -ErrorAction SilentlyContinue
+
+          # Desativar telemetria (DiagTrack)
+          Write-Host "-> Desativando telemetria..."
+          Stop-Service -Name "DiagTrack" -Force -ErrorAction SilentlyContinue
+          Set-Service  -Name "DiagTrack" -StartupType Disabled -ErrorAction SilentlyContinue
+
+          # Otimizar Prefetch
+          Write-Host "-> Otimizando Prefetch..."
+          $pref = "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management\PrefetchParameters"
+          Set-ItemProperty -Path $pref -Name "EnablePrefetcher" -Value 3 -Type DWord -Force
+
+          # Prioridade multimídia / GPU
+          Write-Host "-> Ajustando prioridade multimídia..."
+          $mm = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile"
+          Set-ItemProperty -Path $mm -Name "SystemResponsiveness" -Value 0 -Type DWord -Force
+
+          $games = "$mm\Tasks\Games"
+          if (-not (Test-Path $games)) { New-Item -Path $games -Force | Out-Null }
+          Set-ItemProperty -Path $games -Name "GPU Priority" -Value 8 -Type DWord -Force
+          Set-ItemProperty -Path $games -Name "Priority"     -Value 6 -Type DWord -Force
+
+          Write-Host "[OK] Otimizações aplicadas."
+
+      # ============================================================
+      # 7. LIMPEZA DE PROCESSOS PESADOS
+      # ============================================================
+      - name: Limpar processos pesados
+        if: ${{ github.event.inputs.modo != 'somente-diagnostico' }}
+        continue-on-error: true
+        run: |
+          Write-Host "===== LIMPEZA DE PROCESSOS ====="
+          $procs = @("OneDrive", "Teams", "Cortana", "YourPhone")
+          foreach ($p in $procs) {
+            $found = Get-Process -Name $p -ErrorAction SilentlyContinue
+            if ($found) {
+              Stop-Process -Name $p -Force -ErrorAction SilentlyContinue
+              Write-Host "[OK] $p finalizado"
+            } else {
+              Write-Host "[--] $p não estava rodando"
+            }
+          }
+
+      # ============================================================
+      # 8. TESTE DE ESTABILIDADE
+      # ============================================================
+      - name: Teste de estabilidade (10s)
+        run: |
+          Write-Host "===== TESTE DE ESTABILIDADE ====="
+          $sw = [System.Diagnostics.Stopwatch]::StartNew()
+          $iter = 0
+          $sum  = 0
+          while ($sw.Elapsed.TotalSeconds -lt 10) {
+            for ($i = 0; $i -lt 100000; $i++) {
+              $sum += ($i * $i) % 7
+            }
+            $iter++
+          }
+          $sw.Stop()
+          Write-Host "[OK] $iter ciclos em $([math]::Round($sw.Elapsed.TotalSeconds,2))s (checksum=$sum)"
+
+      # ============================================================
+      # 9. RELATÓRIO FINAL
+      # ============================================================
+      - name: Gerar relatório final
+        if: always()
+        run: |
+          New-Item -ItemType Directory -Force -Path "$env:LOG_DIR" | Out-Null
+          $relatorio = "$env:LOG_DIR\relatorio_final.txt"
+          @"
+          ============================================================
+          RELATÓRIO FINAL — DIAGNÓSTICO RTX 3060 + DIRECTX 11
+          ============================================================
+          Data/Hora     : $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+          Runner        : $env:RUNNER_OS
+          Modo          : ${{ github.event.inputs.modo }}
+          Commit        : ${{ github.sha }}
+          Repositório   : ${{ github.repository }}
+          ============================================================
+          "@ | Out-File -FilePath $relatorio -Encoding UTF8
+          Get-Content $relatorio
+
+      - name: Upload de logs como artefato
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-diagnostico-rtx3060
+          path: ${{ env.LOG_DIR }}
+          retention-days: 7
