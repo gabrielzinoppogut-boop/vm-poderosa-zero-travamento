@@ -1,233 +1,176 @@
-name: Diagnóstico e Otimização — RTX 3060 + DirectX 11
+name: Windows Cloud PC — Tailscale + RDP + RTX 3060 + DX11
 
 on:
   workflow_dispatch:
-    inputs:
-      modo:
-        description: 'Modo de execução'
-        required: true
-        default: 'completo'
-        type: choice
-        options:
-          - completo
-          - somente-diagnostico
-          - somente-otimizacao
-  push:
-    branches: [ main, master ]
-  schedule:
-    - cron: '0 3 * * 0'
-
-# ============================================================
-# FORÇA TODAS AS ACTIONS A RODAR EM NODE 24
-# (elimina o aviso "Node 20 is being deprecated")
-# ============================================================
-env:
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
-  PYTHON_VERSION: '3.11'
-  PYTHONUNBUFFERED: '1'
-  PYTHONDONTWRITEBYTECODE: '1'
-  LOG_DIR: '${{ github.workspace }}\logs'
-
-permissions:
-  contents: read
 
 jobs:
-  diagnostico-windows:
-    name: Executar em Windows (RTX 3060 / DX11)
+  build:
+    name: Iniciando Sistema Reforçado (Tailscale + RDP)
     runs-on: windows-latest
-    timeout-minutes: 30
+    timeout-minutes: 10080   # 7 dias
 
-    defaults:
-      run:
-        shell: pwsh
+    env:
+      # Força Node 24 (elimina o aviso de deprecation do Node 20)
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
+      PROCESSOR_COUNT: 8
+      OPENGL: "1"
+      GITHUB_PRESERVE_WORKFLOW: true
+      MEMORY_GB: 16
 
     steps:
       # ============================================================
-      # 1. CHECKOUT
+      # 1. INFORMAÇÕES DO RUNNER
       # ============================================================
-      - name: Checkout do repositório
-        uses: actions/checkout@v4
-
-      # ============================================================
-      # 2. SETUP PYTHON (SEM cache: 'pip' para evitar o erro)
-      # ============================================================
-      - name: Configurar Python ${{ env.PYTHON_VERSION }}
-        uses: actions/setup-python@v5
-        with:
-          python-version: ${{ env.PYTHON_VERSION }}
-          # cache: 'pip'  <-- REMOVIDO: era isso que quebrava quando
-          #                  não existe requirements.txt / pyproject.toml
-
-      - name: Instalar dependências
+      - name: Diagnóstico do runner
         run: |
-          python -m pip install --upgrade pip
-          pip install psutil colorama
-
-      # ============================================================
-      # 3. INFORMAÇÕES DO SISTEMA
-      # ============================================================
-      - name: Coletar informações do sistema
-        run: |
-          Write-Host "===== INFORMAÇÕES DO SISTEMA ====="
+          Write-Host "===== SISTEMA ====="
           Get-ComputerInfo | Select-Object WindowsProductName, WindowsVersion, OsArchitecture, CsProcessors, CsTotalPhysicalMemory
-          Write-Host "`n===== CPU ====="
-          Get-CimInstance Win32_Processor | Select-Object Name, NumberOfCores, NumberOfLogicalProcessors, MaxClockSpeed
-          Write-Host "`n===== MEMÓRIA ====="
-          Get-CimInstance Win32_PhysicalMemory | Select-Object Capacity, Speed, Manufacturer
+          Write-Host "`n===== GPU (WMI) ====="
+          Get-CimInstance Win32_VideoController | Select-Object Name, DriverVersion, AdapterRAM
 
       # ============================================================
-      # 4. VERIFICAÇÃO DA GPU (RTX 3060)
+      # 2. HABILITAR ÁREA DE TRABALHO REMOTA (RDP)
       # ============================================================
-      - name: Verificar GPU RTX 3060
-        continue-on-error: true
+      - name: Habilitar RDP no Windows
         run: |
-          Write-Host "===== VERIFICAÇÃO DA GPU ====="
-          $smi = "C:\Windows\System32\nvidia-smi.exe"
-          if (Test-Path $smi) {
-            & $smi --query-gpu=name,driver_version,memory.total,temperature.gpu,utilization.gpu,power.draw --format=csv
-            Write-Host "[OK] nvidia-smi executado com sucesso"
-          } else {
-            Write-Host "[AVISO] nvidia-smi não disponível neste runner."
-          }
-          Write-Host "`n===== GPUs detectadas via WMI ====="
-          Get-CimInstance Win32_VideoController | Select-Object Name, DriverVersion, AdapterRAM, VideoProcessor
+          Write-Host "-> Habilitando Remote Desktop..."
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
+
+          Write-Host "-> Criando usuário 'dev' com senha forte..."
+          $senha = ConvertTo-SecureString "Dev@RTX3060!2026" -AsPlainText -Force
+          New-LocalUser -Name "dev" -Password $senha -PasswordNeverExpires -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Administradores" -Member "dev" -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Administrators" -Member "dev" -ErrorAction SilentlyContinue
+
+          Write-Host "[OK] RDP pronto na porta 3389."
 
       # ============================================================
-      # 5. VERIFICAÇÃO DO DIRECTX 11
+      # 3. INSTALAR TAILSCALE
       # ============================================================
-      - name: Verificar DirectX 11
-        continue-on-error: true
+      - name: Instalar Tailscale
         run: |
-          Write-Host "===== VERIFICAÇÃO DIRECTX ====="
-          $dxKeys = @(
-            "HKLM:\SOFTWARE\Microsoft\DirectX",
-            "HKLM:\SOFTWARE\WOW6432Node\Microsoft\DirectX"
-          )
-          foreach ($key in $dxKeys) {
-            if (Test-Path $key) {
-              Get-ItemProperty -Path $key -ErrorAction SilentlyContinue |
-                Select-Object Version, InstalledVersion
-            }
-          }
-          Write-Host "`n===== DLLs DirectX 11 ====="
-          $dxFiles = @(
-            "C:\Windows\System32\d3d11.dll",
-            "C:\Windows\System32\dxgi.dll",
-            "C:\Windows\System32\d3dcompiler_47.dll",
-            "C:\Windows\System32\dxva2.dll"
-          )
-          foreach ($f in $dxFiles) {
-            if (Test-Path $f) {
-              $ver = (Get-Item $f).VersionInfo.FileVersion
-              Write-Host "[OK] $(Split-Path $f -Leaf) — versão $ver"
-            } else {
-              Write-Host "[FALTA] $(Split-Path $f -Leaf)"
-            }
-          }
+          Write-Host "-> Baixando Tailscale..."
+          $url = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
+          Invoke-WebRequest -Uri $url -OutFile "$env:TEMP\tailscale.msi" -UseBasicParsing
+
+          Write-Host "-> Instalando Tailscale silenciosamente..."
+          Start-Process msiexec.exe -ArgumentList "/i `"$env:TEMP\tailscale.msi`" /quiet /norestart" -Wait
+
+          Write-Host "-> Verificando instalação..."
+          & "C:\Program Files\Tailscale\tailscale.exe" version
 
       # ============================================================
-      # 6. OTIMIZAÇÕES DE PERFORMANCE (sem firewall, sem TV)
+      # 4. CONECTAR À TAILSCALE
       # ============================================================
-      - name: Aplicar otimizações de performance
-        if: ${{ github.event.inputs.modo != 'somente-diagnostico' }}
+      - name: Conectar à Tailscale
+        env:
+          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+        run: |
+          if (-not $env:TAILSCALE_AUTHKEY) {
+            Write-Host "❌ ERRO: secret TAILSCALE_AUTHKEY não configurado!"
+            Write-Host "Vá em: Settings → Secrets and variables → Actions → New repository secret"
+            Write-Host "Crie: TAILSCALE_AUTHKEY = sua chave gerada em https://login.tailscale.com/admin/settings/keys"
+            exit 1
+          }
+
+          Write-Host "-> Conectando Tailscale..."
+          & "C:\Program Files\Tailscale\tailscale.exe" up --authkey=$env:TAILSCALE_AUTHKEY --hostname=rtx3060-cloud --accept-routes --advertise-tags=tag:ci
+
+          Write-Host "-> Status da Tailscale:"
+          & "C:\Program Files\Tailscale\tailscale.exe" status
+
+          Write-Host "-> IP Tailscale desta máquina:"
+          $ip = & "C:\Program Files\Tailscale\tailscale.exe" ip -4
+          Write-Host "🌐 IP: $ip" 
+          Write-Host "🌐 Use esse IP no RDP: mstsc.exe /v:$ip"
+
+      # ============================================================
+      # 5. OTIMIZAÇÕES RTX 3060 + DIRECTX 11
+      # ============================================================
+      - name: Otimizar performance (RTX 3060 + DX11)
         continue-on-error: true
         run: |
-          Write-Host "===== OTIMIZAÇÕES DE PERFORMANCE ====="
-          Write-Host "-> Ativando plano de energia ALTO DESEMPENHO..."
+          Write-Host "===== OTIMIZAÇÕES ====="
+
+          Write-Host "-> Plano de energia ALTO DESEMPENHO..."
           powercfg /setactive SCHEME_MIN
-          powercfg /list
 
-          Write-Host "-> Ajustando prioridade DirectX 11..."
+          Write-Host "-> Prioridade DirectX 11..."
           $dxReg = "HKCU:\Software\Microsoft\DirectX\UserGpuPreferences"
           if (-not (Test-Path $dxReg)) { New-Item -Path $dxReg -Force | Out-Null }
           Set-ItemProperty -Path $dxReg -Name "DirectXUserGlobalSettings" `
             -Value "VRROptimizeEnable=0;SwapEffectUpgradeEnable=1;" -Force
 
-          Write-Host "-> Reduzindo indexação..."
-          Set-Service -Name "WSearch" -StartupType Manual -ErrorAction SilentlyContinue
+          Write-Host "-> Verificando DLLs do DirectX 11..."
+          $dxFiles = @(
+            "C:\Windows\System32\d3d11.dll",
+            "C:\Windows\System32\dxgi.dll",
+            "C:\Windows\System32\d3dcompiler_47.dll"
+          )
+          foreach ($f in $dxFiles) {
+            if (Test-Path $f) {
+              Write-Host "[OK] $(Split-Path $f -Leaf)"
+            } else {
+              Write-Host "[FALTA] $(Split-Path $f -Leaf)"
+            }
+          }
 
-          Write-Host "-> Desativando telemetria..."
+          Write-Host "-> Telemetria off (DiagTrack)..."
           Stop-Service -Name "DiagTrack" -Force -ErrorAction SilentlyContinue
           Set-Service  -Name "DiagTrack" -StartupType Disabled -ErrorAction SilentlyContinue
-
-          Write-Host "-> Otimizando Prefetch..."
-          $pref = "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management\PrefetchParameters"
-          Set-ItemProperty -Path $pref -Name "EnablePrefetcher" -Value 3 -Type DWord -Force
-
-          Write-Host "-> Ajustando prioridade multimídia..."
-          $mm = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile"
-          Set-ItemProperty -Path $mm -Name "SystemResponsiveness" -Value 0 -Type DWord -Force
-
-          $games = "$mm\Tasks\Games"
-          if (-not (Test-Path $games)) { New-Item -Path $games -Force | Out-Null }
-          Set-ItemProperty -Path $games -Name "GPU Priority" -Value 8 -Type DWord -Force
-          Set-ItemProperty -Path $games -Name "Priority"     -Value 6 -Type DWord -Force
 
           Write-Host "[OK] Otimizações aplicadas."
 
       # ============================================================
-      # 7. LIMPEZA DE PROCESSOS PESADOS
+      # 6. MOSTRAR INFORMAÇÕES DE CONEXÃO
       # ============================================================
-      - name: Limpar processos pesados
-        if: ${{ github.event.inputs.modo != 'somente-diagnostico' }}
-        continue-on-error: true
+      - name: Mostrar dados de conexão
         run: |
-          Write-Host "===== LIMPEZA DE PROCESSOS ====="
-          $procs = @("OneDrive", "Teams", "Cortana", "YourPhone")
-          foreach ($p in $procs) {
-            $found = Get-Process -Name $p -ErrorAction SilentlyContinue
-            if ($found) {
-              Stop-Process -Name $p -Force -ErrorAction SilentlyContinue
-              Write-Host "[OK] $p finalizado"
-            } else {
-              Write-Host "[--] $p não estava rodando"
-            }
+          $ip = & "C:\Program Files\Tailscale\tailscale.exe" ip -4
+          Write-Host "================================================"
+          Write-Host "  🔗 CONEXÃO RDP PRONTA"
+          Write-Host "================================================"
+          Write-Host "  IP Tailscale : $ip"
+          Write-Host "  Usuário      : dev"
+          Write-Host "  Senha        : Dev@RTX3060!2026"
+          Write-Host "  Porta        : 3389"
+          Write-Host ""
+          Write-Host "  No seu PC (com Tailscale logado), rode:"
+          Write-Host "     mstsc.exe /v:$ip"
+          Write-Host "================================================"
+
+      # ============================================================
+      # 7. MONITORAMENTO CONTÍNUO (mantém RDP + Tailscale vivos)
+      # ============================================================
+      - name: Monitoramento Contínuo
+        run: |
+          while ($true) {
+              # Garante que o RDP está ativo
+              $rdp = (Get-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections").fDenyTSConnections
+              if ($rdp -ne 0) {
+                  Write-Host "⚠️ RDP caiu — reabilitando..."
+                  Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
+              }
+
+              # Garante que Tailscale está rodando
+              $ts = Get-Process -Name "tailscaled" -ErrorAction SilentlyContinue
+              if (-not $ts) {
+                  Write-Host "⚠️ Tailscale caiu — reiniciando..."
+                  Restart-Service -Name "Tailscale" -Force -ErrorAction SilentlyContinue
+              }
+
+              $ip = & "C:\Program Files\Tailscale\tailscale.exe" ip -4 2>$null
+              Write-Host "[$(Get-Date -Format 'HH:mm:ss')] ✅ Online — IP: $ip"
+
+              Start-Sleep -Seconds 60
           }
 
       # ============================================================
-      # 8. TESTE DE ESTABILIDADE
+      # 8. LIMPEZA
       # ============================================================
-      - name: Teste de estabilidade (10s)
-        run: |
-          Write-Host "===== TESTE DE ESTABILIDADE ====="
-          $sw = [System.Diagnostics.Stopwatch]::StartNew()
-          $iter = 0
-          $sum  = 0
-          while ($sw.Elapsed.TotalSeconds -lt 10) {
-            for ($i = 0; $i -lt 100000; $i++) {
-              $sum += ($i * $i) % 7
-            }
-            $iter++
-          }
-          $sw.Stop()
-          Write-Host "[OK] $iter ciclos em $([math]::Round($sw.Elapsed.TotalSeconds,2))s (checksum=$sum)"
-
-      # ============================================================
-      # 9. RELATÓRIO FINAL + UPLOAD
-      # ============================================================
-      - name: Gerar relatório final
+      - name: Limpeza Segura
         if: always()
         run: |
-          New-Item -ItemType Directory -Force -Path "$env:LOG_DIR" | Out-Null
-          $relatorio = "$env:LOG_DIR\relatorio_final.txt"
-          @"
-          ============================================================
-          RELATÓRIO FINAL — DIAGNÓSTICO RTX 3060 + DIRECTX 11
-          ============================================================
-          Data/Hora     : $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
-          Runner        : $env:RUNNER_OS
-          Modo          : ${{ github.event.inputs.modo }}
-          Commit        : ${{ github.sha }}
-          Repositório   : ${{ github.repository }}
-          Node Runtime  : Node 24 (forçado)
-          ============================================================
-          "@ | Out-File -FilePath $relatorio -Encoding UTF8
-          Get-Content $relatorio
-
-      - name: Upload de logs como artefato
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: logs-diagnostico-rtx3060
-          path: ${{ env.LOG_DIR }}
-          retention-days: 7
+          Remove-Item "$env:TEMP\tailscale.msi" -Force -ErrorAction SilentlyContinue
+          Write-Host "Limpeza finalizada."
